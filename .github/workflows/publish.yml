@@ -1,0 +1,64 @@
+name: Publish SuanliAI Plugin
+
+on:
+  push:
+    branches: [main]
+    paths: ['plugin/**', 'tests/**', 'build_release.py', 'RELEASE_NOTES.md', '.github/workflows/publish.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: suanliai-plugin-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install test dependency
+        run: python -m pip install requests
+      - name: Verify plugin behavior
+        run: |
+          python -m unittest discover -s tests -p 'test_*.py'
+          node --check plugin/ui/app.js
+          for check in tests/*.cjs; do node "$check"; done
+      - name: Build versioned installation package
+        run: python build_release.py
+      - name: Publish verified ZIP and update manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, subprocess, tempfile
+          manifest = json.loads(pathlib.Path('dist/latest.json').read_bytes())
+          assert os.environ['GH_REPO'] == 'huangweif522-star/SuanliAI-Plugin'
+          assert manifest['plugin'] == 'SuanliAI-Plugin'
+          version = manifest['version']
+          tag = 'v' + version
+          package = pathlib.Path('dist') / ('Suanli_Ai_v' + version + '.zip')
+          assert hashlib.sha256(package.read_bytes()).hexdigest() == manifest['sha256']
+          result = subprocess.run(['gh', 'release', 'view', tag, '--json', 'isDraft'], text=True, capture_output=True)
+          if result.returncode == 0 and not json.loads(result.stdout)['isDraft']:
+              with tempfile.TemporaryDirectory() as temp:
+                  subprocess.run(['gh', 'release', 'download', tag, '--pattern', package.name, '--dir', temp], check=True)
+                  actual = pathlib.Path(temp) / package.name
+                  assert hashlib.sha256(actual.read_bytes()).hexdigest() == manifest['sha256'], 'Published package differs; bump the version'
+              print(tag + ' is already published with the same package.')
+              raise SystemExit(0)
+          if result.returncode != 0:
+              subprocess.run(['gh', 'release', 'create', tag, '--draft', '--target', os.environ['GITHUB_SHA'],
+                              '--title', '算力AI视频 ' + tag, '--notes-file', 'RELEASE_NOTES.md'], check=True)
+          subprocess.run(['gh', 'release', 'upload', tag, str(package), 'dist/latest.json', 'dist/SHA256SUMS', '--clobber'], check=True)
+          subprocess.run(['gh', 'release', 'edit', tag, '--draft=false', '--latest'], check=True)
+          print('Published ' + tag + ' and its independent update manifest.')
